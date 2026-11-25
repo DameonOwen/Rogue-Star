@@ -191,10 +191,156 @@ let staticIconAssetRegistry: IconAssetRegistry | null = null;
 let staticIconAssetRegistrySource: string | null = null;
 let staticIconAssetRegistryLoadKey: string | null = null;
 let staticIconAssetRegistryLoad: Promise<IconAssetRegistry> | null = null;
+let staticRegistryWorker: Worker | null = null;
+let staticRegistryWorkerRequestSequence = 0;
 
 const dataUriPrefix = 'data:image/png;base64,';
 const STATIC_REGISTRY_FETCH_ATTEMPTS = 8;
 const STATIC_REGISTRY_FETCH_RETRY_MS = 250;
+
+const staticRegistryWorkerBootstrap = () => {
+  const ctx = self as any;
+  const queue: any[] = [];
+  let busy = false;
+  const runNext = () => {
+    if (busy) {
+      return;
+    }
+    const job = queue.shift();
+    if (!job) {
+      return;
+    }
+    busy = true;
+    const attemptFetch = (attempt: number): Promise<any> =>
+      fetch(job.url, { cache: 'force-cache' }).then((response: any) => {
+        if (response.ok === false && response.status !== 0) {
+          throw new Error(
+            'Atlas registry request failed with status ' + response.status + '.'
+          );
+        }
+        return response.json();
+      });
+    const attemptWithRetry = (attempt: number): Promise<any> =>
+      attemptFetch(attempt).catch((error: any) => {
+        if (attempt >= job.attempts) {
+          throw error;
+        }
+        return new Promise((resolve: any, reject: any) => {
+          setTimeout(() => {
+            attemptWithRetry(attempt + 1).then(resolve, reject);
+          }, job.retryMs * attempt);
+        });
+      });
+    attemptWithRetry(1).then(
+      (registry: any) => {
+        ctx.postMessage({ id: job.id, ok: true, registry: registry });
+        busy = false;
+        runNext();
+      },
+      (error: any) => {
+        const message = error && error.message ? error.message : String(error);
+        ctx.postMessage({ id: job.id, ok: false, error: message });
+        busy = false;
+        runNext();
+      }
+    );
+  };
+  ctx.onmessage = (event: any) => {
+    const data = event && event.data;
+    if (!data || typeof data.url !== 'string' || !data.url) {
+      return;
+    }
+    queue.push({
+      id: data.id,
+      url: data.url,
+      attempts: data.attempts,
+      retryMs: data.retryMs,
+    });
+    runNext();
+  };
+};
+
+const ensureStaticRegistryWorker = (): Worker | null => {
+  if (staticRegistryWorker !== undefined) {
+    return staticRegistryWorker;
+  }
+  try {
+    if (
+      typeof Worker === 'undefined' ||
+      typeof Blob === 'undefined' ||
+      typeof URL === 'undefined' ||
+      !URL.createObjectURL
+    ) {
+      // Ensure the features we plan to use exist
+      // If any of those conditions are true, we are running in IE
+      staticRegistryWorker = null;
+      return null;
+    }
+    const source = `(${staticRegistryWorkerBootstrap.toString()})();`;
+    const blob = new Blob([source], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    staticRegistryWorker = new Worker(workerUrl);
+  } catch {
+    staticRegistryWorker = null;
+  }
+  return staticRegistryWorker;
+};
+
+const fetchStaticIconAssetRegistryWithWorker = (
+  url: string
+): Promise<unknown> | null => {
+  const worker = ensureStaticRegistryWorker();
+  if (!worker) {
+    return null;
+  }
+  return new Promise<unknown>((resolve, reject) => {
+    const id = ++staticRegistryWorkerRequestSequence;
+    const cleanup = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+    };
+    const onMessage = (event: MessageEvent) => {
+      const data = event?.data as
+        | { id?: number; ok?: boolean; registry?: unknown; error?: unknown }
+        | undefined;
+      if (!data || data.id !== id) {
+        return;
+      }
+      cleanup();
+      if (data.ok) {
+        resolve(data.registry);
+      } else {
+        reject(
+          new Error(
+            typeof data.error === 'string' && data.error
+              ? data.error
+              : 'The atlas registry request failed.'
+          )
+        );
+      }
+    };
+    const onError = () => {
+      cleanup();
+      // The worker is broken, use the fallback
+      staticRegistryWorker = null;
+      reject(new Error('The atlas registry worker failed.'));
+    };
+    worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    try {
+      worker.postMessage({
+        id,
+        url,
+        attempts: STATIC_REGISTRY_FETCH_ATTEMPTS,
+        retryMs: STATIC_REGISTRY_FETCH_RETRY_MS,
+      });
+    } catch {
+      cleanup();
+      staticRegistryWorker = null;
+      reject(new Error('The atlas registry worker failed.'));
+    }
+  });
+};
 
 const storeDynamicAtlasSource = (token: string, png: string) => {
   const existing = dynamicAtlasSources.get(token);
@@ -273,7 +419,27 @@ export const isStaticIconAssetRegistryLoaded = (
   );
 };
 
-const fetchStaticIconAssetRegistry = (
+const fetchStaticIconAssetRegistry = (url: string): Promise<unknown> => {
+  let absoluteUrl = url;
+  try {
+    absoluteUrl = new URL(url, document.baseURI).href;
+  } catch {
+    // Do nothing
+  }
+  const workerPromise = fetchStaticIconAssetRegistryWithWorker(absoluteUrl);
+  if (!workerPromise) {
+    return fetchStaticIconAssetRegistryDirect(absoluteUrl);
+  }
+  return workerPromise.catch((error) => {
+    // Try a direct call if the registry worker is broken
+    if (staticRegistryWorker === null) {
+      return fetchStaticIconAssetRegistryDirect(absoluteUrl);
+    }
+    throw error;
+  });
+};
+
+const fetchStaticIconAssetRegistryDirect = (
   url: string,
   attempt = 1
 ): Promise<unknown> =>
@@ -292,11 +458,13 @@ const fetchStaticIconAssetRegistry = (
       }
       return new Promise<unknown>((resolve, reject) => {
         setTimeout(() => {
-          fetchStaticIconAssetRegistry(url, attempt + 1).then(resolve, reject);
+          fetchStaticIconAssetRegistryDirect(url, attempt + 1).then(
+            resolve,
+            reject
+          );
         }, STATIC_REGISTRY_FETCH_RETRY_MS * attempt);
       });
     });
-
 export const loadStaticIconAssetRegistry = (
   reference: IconAssetRegistryAsset
 ): Promise<IconAssetRegistry> => {
