@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rogue Star Registry Cache</title>
+</head>
+<body>
+<script>
+(function () {
+  'use strict';
+
+  var DB_NAME = 'rogue-star-registry-cache';
+  var DB_VERSION = 1;
+  var STORE = 'registries';
+  var ALLOWED_ORIGIN_PATTERN = /^http:\/\/127\.0\.0\.1(:\d+)?$/;  var dbPromise = null;
+
+  var openDb = function () {
+    if (!dbPromise) {
+      dbPromise = new Promise(function (resolve, reject) {
+        try {
+          if (typeof indexedDB === 'undefined' || !indexedDB) {
+            reject(new Error('IndexedDB is unavailable.'));
+            return;
+          }
+          var request = indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = function () {
+            var database = request.result;
+            if (!database.objectStoreNames.contains(STORE)) {
+              database.createObjectStore(STORE);
+            }
+          };
+          request.onsuccess = function () {
+            resolve(request.result);
+          };
+          request.onerror = function () {
+            reject(request.error);
+          };
+          request.onblocked = function () {
+            reject(new Error('IndexedDB open was blocked.'));
+          };
+        } catch (error) {
+          reject(error);
+        }
+      });
+      dbPromise.catch(function () {
+        dbPromise = null;
+      });
+    }
+    return dbPromise;
+  };
+
+  var sendMessage = function (source, origin, message) {
+    if (!source) {
+      return;
+    }
+    try {
+      source.postMessage(message, origin);
+    } catch (error) {
+      // Ignore
+    }
+  };
+
+  var handleGet = function (key) {
+    return openDb().then(function (database) {
+      return new Promise(function (resolve) {
+        try {
+          var request = database
+            .transaction(STORE, 'readonly')
+            .objectStore(STORE)
+            .get(key);
+          request.onsuccess = function () {
+            var entry = request.result;
+            resolve(
+              entry && typeof entry === 'object' ? entry.value || null : null
+            );
+          };
+          request.onerror = function () {
+            resolve(null);
+          };
+        } catch (error) {
+          resolve(null);
+        }
+      });
+    });
+  };
+
+  var listKeys = function (database) {
+    return new Promise(function (resolve) {
+      var keys = [];
+      try {
+        var request = database
+          .transaction(STORE, 'readonly')
+          .objectStore(STORE)
+          .openCursor();
+        request.onsuccess = function () {
+          var cursor = request.result;
+          if (!cursor) {
+            resolve(keys);
+            return;
+          }
+          keys.push(cursor.key);
+          cursor.continue();
+        };
+        request.onerror = function () {
+          resolve(keys);
+        };
+      } catch (error) {
+        resolve(keys);
+      }
+    });
+  };
+
+  var deleteEntries = function (database, keys) {
+    return new Promise(function (resolve) {
+      if (!keys.length) {
+        resolve(true);
+        return;
+      }
+      try {
+        var transaction = database.transaction(STORE, 'readwrite');
+        var store = transaction.objectStore(STORE);
+        for (var index = 0; index < keys.length; index += 1) {
+          store.delete(keys[index]);
+        }
+        transaction.oncomplete = function () {
+          resolve(true);
+        };
+        transaction.onerror = function () {
+          resolve(false);
+        };
+        transaction.onabort = function () {
+          resolve(false);
+        };
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  };
+
+  var handlePut = function (key, value) {
+    var entry = { storedAt: Date.now(), value: value };
+    return openDb()
+      .then(function (database) {
+        return new Promise(function (resolve) {
+          try {
+            var transaction = database.transaction(STORE, 'readwrite');
+            transaction.objectStore(STORE).put(entry, key);
+            transaction.oncomplete = function () {
+              resolve(true);
+            };
+            transaction.onerror = function () {
+              resolve(false);
+            };
+            transaction.onabort = function () {
+              resolve(false);
+            };
+          } catch (error) {
+            resolve(false);
+          }
+        });
+      })
+      .then(function (stored) {
+        if (!stored) {
+          return false;
+        }
+        return openDb()
+          .then(function (database) {
+            return listKeys(database);
+          })
+          .then(function (keys) {
+            var staleKeys = [];
+            for (var index = 0; index < keys.length; index += 1) {
+              if (keys[index] !== key) {
+                staleKeys.push(keys[index]);
+              }
+            }
+            return openDb().then(function (database) {
+              return deleteEntries(database, staleKeys);
+            });
+          });
+      });
+  };
+
+  window.addEventListener('message', function (event) {
+    if (!ALLOWED_ORIGIN_PATTERN.test(event.origin)) {
+      return;
+    }
+    var message = event.data;
+    if (!message || typeof message !== 'object') {
+      return;
+    }
+    var id = typeof message.id === 'number' ? message.id : null;
+    if (id === null) {
+      return;
+    }
+    var respond = function (result) {
+      sendMessage(event.source, event.origin, {
+        id: id,
+        result: result,
+      });
+    };
+    var key = typeof message.key === 'string' && message.key
+      ? message.key
+      : null;
+    if (message.cmd === 'get' && key) {
+      handleGet(key).then(respond, function () {
+        respond(null);
+      });
+      return;
+    }
+    if (
+      message.cmd === 'put' &&
+      key &&
+      message.value &&
+      typeof message.value === 'object'
+    ) {
+      handlePut(key, message.value).then(respond, function () {
+        respond(false);
+      });
+      return;
+    }
+    respond(null);
+  });
+})();
+</script>
+</body>
+</html>

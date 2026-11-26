@@ -151,6 +151,8 @@ type ScheduledPreviewWork = {
   completed: boolean;
 };
 
+type RegistryCacheShimResolver = (result: unknown) => void;
+
 const PREVIEW_WORK_BUDGET_MS = 4;
 const PREVIEW_WORK_MAX_TASKS_PER_BATCH = 24;
 const PREVIEW_BACKGROUND_DELAY_MS = 32;
@@ -193,10 +195,20 @@ let staticIconAssetRegistryLoadKey: string | null = null;
 let staticIconAssetRegistryLoad: Promise<IconAssetRegistry> | null = null;
 let staticRegistryWorker: Worker | null = null;
 let staticRegistryWorkerRequestSequence = 0;
+let registryCacheShimWindowPromise: Promise<Window | null> | null = null;
+let registryCacheShimSequence = 0;
 
+const registryCacheShimPending = new Map<number, RegistryCacheShimResolver>();
 const dataUriPrefix = 'data:image/png;base64,';
 const STATIC_REGISTRY_FETCH_ATTEMPTS = 8;
 const STATIC_REGISTRY_FETCH_RETRY_MS = 250;
+
+// Point this at the deployed registry-cache.html,
+// i.e. 'https://TS-Rogue-Star.github.io/Rogue-Star/registry-cache.html'.
+// An empty string disables the persistent registry cache.
+const REGISTRY_CACHE_SHIM_URL =
+  'https://dameonowen.github.io/Rogue-Star/registry-cache.html';
+const REGISTRY_CACHE_SHIM_TIMEOUT_MS = 2000;
 
 const staticRegistryWorkerBootstrap = () => {
   const ctx = self as any;
@@ -465,6 +477,173 @@ const fetchStaticIconAssetRegistryDirect = (
         }, STATIC_REGISTRY_FETCH_RETRY_MS * attempt);
       });
     });
+
+const getRegistryCacheShimOrigin = (): string | null => {
+  if (!REGISTRY_CACHE_SHIM_URL) {
+    return null;
+  }
+  try {
+    return new URL(REGISTRY_CACHE_SHIM_URL, document.baseURI).origin;
+  } catch {
+    return null;
+  }
+};
+
+const handleRegistryCacheShimMessage = (event: MessageEvent) => {
+  const data = event.data as { id?: unknown; result?: unknown } | undefined;
+  if (!data) {
+    return;
+  }
+  const origin = getRegistryCacheShimOrigin();
+  if (!origin || event.origin !== origin || typeof data.id !== 'number') {
+    return;
+  }
+  const resolver = registryCacheShimPending.get(data.id);
+  if (!resolver) {
+    return;
+  }
+  registryCacheShimPending.delete(data.id);
+  resolver(data.result);
+};
+
+const ensureRegistryCacheShim = (): Promise<Window | null> => {
+  if (registryCacheShimWindowPromise) {
+    return registryCacheShimWindowPromise;
+  }
+  registryCacheShimWindowPromise = new Promise<Window | null>((resolve) => {
+    try {
+      const origin = getRegistryCacheShimOrigin();
+      if (
+        !origin ||
+        typeof document === 'undefined' ||
+        typeof window === 'undefined' ||
+        typeof window.postMessage !== 'function' ||
+        !!(document as Document & { documentMode?: unknown }).documentMode
+      ) {
+        // Do not attempt to load the shim in IE
+        resolve(null);
+        return;
+      }
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.setAttribute('aria-hidden', 'true');
+      let settled = false;
+      const settle = (result: Window | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        iframe.onload = null;
+        iframe.onerror = null;
+        resolve(result);
+      };
+      const timer = setTimeout(
+        () => settle(null),
+        REGISTRY_CACHE_SHIM_TIMEOUT_MS
+      );
+      iframe.onload = () => {
+        settle(iframe.contentWindow || null);
+      };
+      iframe.onerror = () => {
+        settle(null);
+      };
+      window.addEventListener('message', handleRegistryCacheShimMessage);
+      (document.body || document.documentElement).appendChild(iframe);
+      iframe.src = REGISTRY_CACHE_SHIM_URL;
+    } catch {
+      resolve(null);
+    }
+  });
+  return registryCacheShimWindowPromise;
+};
+
+const registryCacheShimCall = <T>(
+  shim: Window,
+  origin: string,
+  payload: Record<string, unknown>
+): Promise<T | null> =>
+  new Promise<T | null>((resolve) => {
+    const id = ++registryCacheShimSequence;
+    const timer = setTimeout(() => {
+      registryCacheShimPending.delete(id);
+      resolve(null);
+    }, REGISTRY_CACHE_SHIM_TIMEOUT_MS);
+    registryCacheShimPending.set(id, (result) => {
+      clearTimeout(timer);
+      resolve(
+        (result === undefined || result === null ? null : result) as T | null
+      );
+    });
+    try {
+      shim.postMessage({ ...payload, id }, origin);
+    } catch {
+      clearTimeout(timer);
+      registryCacheShimPending.delete(id);
+      resolve(null);
+    }
+  });
+
+const readRegistryCacheShimEntry = async (
+  loadKey: string
+): Promise<unknown> => {
+  const origin = getRegistryCacheShimOrigin();
+  if (!origin) {
+    return null;
+  }
+  const shim = await ensureRegistryCacheShim();
+  if (!shim) {
+    return null;
+  }
+  const entry = await registryCacheShimCall<{ value?: unknown }>(shim, origin, {
+    cmd: 'get',
+    key: loadKey,
+  });
+  if (!entry || typeof entry !== 'object' || !('value' in entry)) {
+    return null;
+  }
+  return (entry as { value?: unknown }).value ?? null;
+};
+
+const storeRegistryCacheShimEntry = (
+  loadKey: string,
+  registry: IconAssetRegistry
+): void => {
+  const origin = getRegistryCacheShimOrigin();
+  if (!origin) {
+    return;
+  }
+  ensureRegistryCacheShim()
+    .then((shim) => {
+      if (!shim) {
+        return;
+      }
+      void registryCacheShimCall(shim, origin, {
+        cmd: 'put',
+        key: loadKey,
+        value: registry,
+      });
+    })
+    .catch(() => {});
+};
+
+const validateStaticIconAssetRegistry = (
+  registry: unknown,
+  revision: number
+): IconAssetRegistry | null => {
+  const resolved = registry as IconAssetRegistry | null | undefined;
+  if (
+    !resolved ||
+    resolved.revision !== revision ||
+    !resolved.assets ||
+    typeof resolved.assets !== 'object' ||
+    Array.isArray(resolved.assets)
+  ) {
+    return null;
+  }
+  return resolved;
+};
+
 export const loadStaticIconAssetRegistry = (
   reference: IconAssetRegistryAsset
 ): Promise<IconAssetRegistry> => {
@@ -480,29 +659,36 @@ export const loadStaticIconAssetRegistry = (
   ) {
     return staticIconAssetRegistryLoad;
   }
-  const load = fetchStaticIconAssetRegistry(resolveAsset(reference.asset))
-    .then((registry) => {
-      const resolved = registry as IconAssetRegistry;
-      if (
-        !resolved ||
-        resolved.revision !== reference.revision ||
-        !resolved.assets ||
-        typeof resolved.assets !== 'object' ||
-        Array.isArray(resolved.assets)
-      ) {
-        throw new Error(
-          `Atlas registry revision ${reference.revision} was invalid.`
-        );
-      }
-      return resolved;
-    })
-    .catch((error) => {
-      if (staticIconAssetRegistryLoadKey === loadKey) {
-        staticIconAssetRegistryLoadKey = null;
-        staticIconAssetRegistryLoad = null;
-      }
-      throw error;
-    });
+  const load = (async () => {
+    const cached = await readRegistryCacheShimEntry(loadKey);
+    const cachedRegistry = validateStaticIconAssetRegistry(
+      cached,
+      reference.revision
+    );
+    if (cachedRegistry) {
+      return cachedRegistry;
+    }
+    const fetched = await fetchStaticIconAssetRegistry(
+      resolveAsset(reference.asset)
+    );
+    const resolved = validateStaticIconAssetRegistry(
+      fetched,
+      reference.revision
+    );
+    if (!resolved) {
+      throw new Error(
+        `Atlas registry revision ${reference.revision} was invalid.`
+      );
+    }
+    storeRegistryCacheShimEntry(loadKey, resolved);
+    return resolved;
+  })().catch((error) => {
+    if (staticIconAssetRegistryLoadKey === loadKey) {
+      staticIconAssetRegistryLoadKey = null;
+      staticIconAssetRegistryLoad = null;
+    }
+    throw error;
+  });
   staticIconAssetRegistryLoadKey = loadKey;
   staticIconAssetRegistryLoad = load;
   return load;

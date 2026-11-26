@@ -1,0 +1,33 @@
+name: Deploy registry cache shim
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'tgui/public/registry-cache.html'
+      - '.github/workflows/deploy-registry-cache.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage shim
+        run: |
+          mkdir -p pages
+          cp tgui/public/registry-cache.html pages/registry-cache.html
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./pages
+          force_orphan: false
