@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - parallelize-asset-delivery
     paths:
       - 'tgui/public/registry-cache.html'
       - '.github/workflows/deploy-registry-cache.yml'
